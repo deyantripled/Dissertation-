@@ -11,7 +11,6 @@ import numpy as np
 import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 import quantstats as qs
-import matplotlib.pyplot as plt
 import sys
 
 # --- 1. Configuration and Parameters ---
@@ -25,7 +24,7 @@ SCALER_FILE = 'scaler_params.npy'
 ENCODER_FILE = 'label_encoder.npy'
 
 # The ONLY data file to be used for this backtest.
-TEST_DATA_FILE = '/home/tripled/backtest_data/OUT OF SAMPLE TEST 15 PERCENT.csv'
+TEST_DATA_FILE = '/workspaces/Dissertation-/OUT OF SAMPLE TEST 15 PERCENT.csv'
 
 # --- 2. Load Core AI Assets and Test Data ---
 print("--- Loading all required assets for final backtesting ---")
@@ -35,7 +34,6 @@ try:
     scaler = MinMaxScaler()
     scaler.min_, scaler.scale_ = scaler_params[0], scaler_params[1]
     label_classes = np.load(ENCODER_FILE, allow_pickle=True)
-    # Load the single, self-contained test file
     test_df = pd.read_csv(TEST_DATA_FILE, index_col='Datetime', parse_dates=True)
 except (FileNotFoundError, IOError) as e:
     print(f"FATAL ERROR: Could not load necessary files. {e}")
@@ -70,7 +68,6 @@ print(f"Final, untouched test data prepared: {test_df.index.min()} to {test_df.i
 
 # --- 4. Helper Function for AI Prediction ---
 def get_ai_prediction(data_window, model, scaler, label_classes):
-    """Generates an AI state prediction for a given window of data."""
     scaled_window = scaler.transform(data_window.values)
     reshaped_window = np.reshape(scaled_window, (1, scaled_window.shape[0], scaled_window.shape[1]))
     prediction_probs = model.predict(reshaped_window, verbose=0)
@@ -90,26 +87,18 @@ for i in range(1, len(test_df)):
     current_price = test_df['Close'].iloc[i]
     previous_price = test_df['Close'].iloc[i-1]
     current_capital = benchmark_equity[-1]
-
-    # If in a position, update equity based on price change
     if position == 1:
         current_capital *= (current_price / previous_price)
-
-    # Check for exit conditions
-    if position == 1:
-        if current_price <= stop_loss_price or test_df['sell_signal'].iloc[i]:
-            exit_price = stop_loss_price if current_price <= stop_loss_price else current_price
-            current_capital = benchmark_equity[-1] * (exit_price / previous_price) # Recalculate from previous equity
-            current_capital *= (1 - COMMISSION_RATE)
-            position = 0
-
-    # Check for entry conditions
+    if position == 1 and (current_price <= stop_loss_price or test_df['sell_signal'].iloc[i]):
+        exit_price = stop_loss_price if current_price <= stop_loss_price else current_price
+        current_capital = benchmark_equity[-1] * (exit_price / previous_price)
+        current_capital *= (1 - COMMISSION_RATE)
+        position = 0
     if position == 0 and test_df['buy_signal'].iloc[i]:
         position = 1
         entry_price = current_price
         current_capital *= (1 - COMMISSION_RATE)
         stop_loss_price = entry_price - (2 * test_df['atr'].iloc[i])
-
     benchmark_equity.append(current_capital)
 
 benchmark_returns = pd.Series(benchmark_equity, index=test_df.index, name="Benchmark").pct_change().fillna(0)
@@ -130,87 +119,62 @@ for i in range(len(test_df)):
     current_price = test_df['Close'].iloc[i]
     previous_price = test_df['Close'].iloc[i-1] if i > 0 else current_price
     current_capital = champion_equity[-1] if champion_equity else INITIAL_CAPITAL
-
-    # Wait for enough data to form a full lookback window
     if i < lookback_window:
         champion_equity.append(current_capital)
         continue
-
-    # If in a position, update equity based on price change
     if position == 1:
         current_capital *= (current_price / previous_price)
-
-    # Get AI prediction
     data_window = test_df[feature_columns].iloc[i-lookback_window:i]
     ai_state = get_ai_prediction(data_window, model, scaler, label_classes)
-
-    # Check for exit conditions
-    if position == 1:
-        if current_price <= stop_loss_price or ai_state in ['Panic', 'Correction']:
-            exit_price = stop_loss_price if current_price <= stop_loss_price else current_price
-            current_capital = champion_equity[-1] * (exit_price / previous_price) # Recalculate from previous equity
-            current_capital *= (1 - COMMISSION_RATE)
-            position = 0
-
-    # Check for entry conditions
+    if position == 1 and (current_price <= stop_loss_price or ai_state in ['Panic', 'Correction']):
+        exit_price = stop_loss_price if current_price <= stop_loss_price else current_price
+        current_capital = champion_equity[-1] * (exit_price / previous_price)
+        current_capital *= (1 - COMMISSION_RATE)
+        position = 0
     if position == 0:
         ai_state_history.append(ai_state)
         if len(ai_state_history) > persistence_filter:
             ai_state_history.pop(0)
-
         is_stable_herd = (len(ai_state_history) == persistence_filter and all(s == 'Herd' for s in ai_state_history))
         if is_stable_herd:
             position = 1
             entry_price = current_price
             current_capital *= (1 - COMMISSION_RATE)
             stop_loss_price = entry_price - (2 * test_df['atr'].iloc[i])
-
-    # Trailing Stop Loss Logic
-    if position == 1:
-        if ai_state in ['Herd', 'FOMO']:
-            new_trailing_stop = current_price - (1 * test_df['atr'].iloc[i])
-            stop_loss_price = max(stop_loss_price, new_trailing_stop)
-
+    if position == 1 and ai_state in ['Herd', 'FOMO']:
+        new_trailing_stop = current_price - (1 * test_df['atr'].iloc[i])
+        stop_loss_price = max(stop_loss_price, new_trailing_stop)
     champion_equity.append(current_capital)
 
 champion_returns = pd.Series(champion_equity, index=test_df.index, name="Strategy").pct_change().fillna(0)
 print("True Champion Strategy backtest complete.")
 
+
 # ==============================================================================
-# --- 7. Performance Analysis and Visualization ---
+# --- 7. Performance Analysis and Visualization (MODIFIED FOR TERMINAL) ---
 # ==============================================================================
 print("\n--- Performance Analysis ---")
-benchmark_made_trades = (benchmark_returns != 0).any()
-champion_made_trades = (champion_returns != 0).any()
+benchmark_made_trades = (benchmark_returns.abs().sum() > 0)
+champion_made_trades = (champion_returns.abs().sum() > 0)
 
 if benchmark_made_trades or champion_made_trades:
-    print("At least one strategy was active. Generating final comparative HTML report...")
-    qs.reports.html(
-        champion_returns,
-        benchmark=benchmark_returns,
-        output='final_comparison_report.html',
-        title='The True Champion AI vs. Benchmark',
-        rf=RISK_FREE_RATE
-    )
-    print("\nSaved 'final_comparison_report.html'")
+    if champion_made_trades:
+        print("\n" + "="*80)
+        print(" " * 20 + "The 'True Champion' AI Strategy Report")
+        print("="*80)
+        qs.reports.full(champion_returns, rf=RISK_FREE_RATE)
+    else:
+        print("\n'True Champion' strategy did not make any trades.")
 
-    plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(14, 7))
-
-    # Plot cumulative returns
-    (1 + benchmark_returns).cumprod().plot(ax=ax, label='Benchmark', color='cyan')
-    (1 + champion_returns).cumprod().plot(ax=ax, label='Strategy', color='lime', linewidth=2)
-
-    ax.set_title('Final Strategy Comparison: Equity Curves', fontsize=16)
-    ax.set_ylabel('Cumulative Growth of $1')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    print("\nDisplaying final equity curve comparison plot...")
-    plt.show()
+    if benchmark_made_trades:
+        print("\n" + "="*80)
+        print(" " * 25 + "Enhanced Benchmark Strategy Report")
+        print("="*80)
+        qs.reports.full(benchmark_returns, rf=RISK_FREE_RATE)
+    else:
+        print("\nBenchmark strategy did not make any trades.")
 
 else:
     print("\n" + "="*50)
-    print("CRITICAL FINDING: Neither strategy made any trades during the backtest period.")
-    print("This is a valid scientific result indicating the entry conditions were not met.")
+    print("CRITICAL FINDING: Neither strategy made any trades.")
     print("="*50 + "\n")
