@@ -1,0 +1,216 @@
+# ==============================================================================
+# Step 3 (Definitive Final Backtest): Full Frictions and Reporting
+# ==============================================================================
+# This is the definitive backtesting script. It runs the final, unbiased model
+# on the completely separate, untouched out-of-sample test data to generate
+# the final dissertation results.
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+import quantstats as qs
+import matplotlib.pyplot as plt
+import sys
+
+# --- 1. Configuration and Parameters ---
+INITIAL_CAPITAL = 10000
+COMMISSION_RATE = 0.0001  # 0.01%
+RISK_FREE_RATE = 0.02     # 2.0%
+
+# --- File Paths ---
+MODEL_FILE = 'final_psychology_model.keras'
+SCALER_FILE = 'scaler_params.npy'
+ENCODER_FILE = 'label_encoder.npy'
+
+# The ONLY data file to be used for this backtest.
+TEST_DATA_FILE = '/home/tripled/backtest_data/OUT OF SAMPLE TEST 15 PERCENT.csv'
+
+# --- 2. Load Core AI Assets and Test Data ---
+print("--- Loading all required assets for final backtesting ---")
+try:
+    model = tf.keras.models.load_model(MODEL_FILE)
+    scaler_params = np.load(SCALER_FILE, allow_pickle=True)
+    scaler = MinMaxScaler()
+    scaler.min_, scaler.scale_ = scaler_params[0], scaler_params[1]
+    label_classes = np.load(ENCODER_FILE, allow_pickle=True)
+    # Load the single, self-contained test file
+    test_df = pd.read_csv(TEST_DATA_FILE, index_col='Datetime', parse_dates=True)
+except (FileNotFoundError, IOError) as e:
+    print(f"FATAL ERROR: Could not load necessary files. {e}")
+    sys.exit(1)
+
+# --- 3. "Translate" the Test Data: Calculate All Features from Scratch ---
+print("\n--- Calculating all indicators on the test set from scratch... ---")
+# A. Benchmark Indicators
+fast_ma_period, slow_ma_period = 20, 50
+test_df['fast_ma'] = test_df['Close'].rolling(window=fast_ma_period).mean()
+test_df['slow_ma'] = test_df['Close'].rolling(window=slow_ma_period).mean()
+test_df['buy_signal'] = (test_df['fast_ma'] > test_df['slow_ma']) & (test_df['fast_ma'].shift(1) <= test_df['slow_ma'].shift(1))
+test_df['sell_signal'] = (test_df['fast_ma'] < test_df['slow_ma']) & (test_df['fast_ma'].shift(1) >= test_df['slow_ma'].shift(1))
+
+# B. AI Features
+lookback_window = 60
+test_df['tr1'] = test_df['High'] - test_df['Low']
+test_df['tr2'] = np.abs(test_df['High'] - test_df['Close'].shift(1))
+test_df['tr3'] = np.abs(test_df['Low'] - test_df['Close'].shift(1))
+test_df['true_range'] = test_df[['tr1', 'tr2', 'tr3']].max(axis=1)
+test_df['atr'] = test_df['true_range'].rolling(window=14).mean()
+test_df['return_2H'] = test_df['Close'].pct_change(periods=2)
+test_df['return_5H'] = test_df['Close'].pct_change(periods=5)
+test_df['return_60H'] = test_df['Close'].pct_change(periods=lookback_window)
+test_df['volume_ratio'] = test_df['Volume'] / test_df['Volume'].rolling(window=lookback_window).mean()
+test_df['atr_ratio'] = test_df['atr'] / test_df['atr'].rolling(window=lookback_window).mean()
+
+# C. Clean the final DataFrame
+test_df.dropna(inplace=True)
+feature_columns = ['Close', 'Volume', 'atr', 'return_2H', 'return_5H', 'return_60H', 'volume_ratio', 'atr_ratio']
+print(f"Final, untouched test data prepared: {test_df.index.min()} to {test_df.index.max()} ({len(test_df)} rows)")
+
+# --- 4. Helper Function for AI Prediction ---
+def get_ai_prediction(data_window, model, scaler, label_classes):
+    """Generates an AI state prediction for a given window of data."""
+    scaled_window = scaler.transform(data_window.values)
+    reshaped_window = np.reshape(scaled_window, (1, scaled_window.shape[0], scaled_window.shape[1]))
+    prediction_probs = model.predict(reshaped_window, verbose=0)
+    predicted_class_index = np.argmax(prediction_probs, axis=1)[0]
+    return label_classes[predicted_class_index]
+
+# ==============================================================================
+# --- 5. Backtest 1: Enhanced Benchmark Strategy ---
+# ==============================================================================
+print("\n--- Running Backtest 1: Enhanced Benchmark Strategy ---")
+position = 0
+entry_price = 0
+stop_loss_price = 0
+benchmark_equity = [INITIAL_CAPITAL]
+
+for i in range(1, len(test_df)):
+    current_price = test_df['Close'].iloc[i]
+    previous_price = test_df['Close'].iloc[i-1]
+    current_capital = benchmark_equity[-1]
+
+    # If in a position, update equity based on price change
+    if position == 1:
+        current_capital *= (current_price / previous_price)
+
+    # Check for exit conditions
+    if position == 1:
+        if current_price <= stop_loss_price or test_df['sell_signal'].iloc[i]:
+            exit_price = stop_loss_price if current_price <= stop_loss_price else current_price
+            current_capital = benchmark_equity[-1] * (exit_price / previous_price) # Recalculate from previous equity
+            current_capital *= (1 - COMMISSION_RATE)
+            position = 0
+
+    # Check for entry conditions
+    if position == 0 and test_df['buy_signal'].iloc[i]:
+        position = 1
+        entry_price = current_price
+        current_capital *= (1 - COMMISSION_RATE)
+        stop_loss_price = entry_price - (2 * test_df['atr'].iloc[i])
+
+    benchmark_equity.append(current_capital)
+
+benchmark_returns = pd.Series(benchmark_equity, index=test_df.index, name="Benchmark").pct_change().fillna(0)
+print("Benchmark backtest complete.")
+
+# ==============================================================================
+# --- 6. Backtest 2: The "True Champion" AI Strategy ---
+# ==============================================================================
+print("\n--- Running Backtest 2: The 'True Champion' Strategy ---")
+position = 0
+entry_price = 0
+stop_loss_price = 0
+champion_equity = []
+ai_state_history = []
+persistence_filter = 3
+
+for i in range(len(test_df)):
+    current_price = test_df['Close'].iloc[i]
+    previous_price = test_df['Close'].iloc[i-1] if i > 0 else current_price
+    current_capital = champion_equity[-1] if champion_equity else INITIAL_CAPITAL
+
+    # Wait for enough data to form a full lookback window
+    if i < lookback_window:
+        champion_equity.append(current_capital)
+        continue
+
+    # If in a position, update equity based on price change
+    if position == 1:
+        current_capital *= (current_price / previous_price)
+
+    # Get AI prediction
+    data_window = test_df[feature_columns].iloc[i-lookback_window:i]
+    ai_state = get_ai_prediction(data_window, model, scaler, label_classes)
+
+    # Check for exit conditions
+    if position == 1:
+        if current_price <= stop_loss_price or ai_state in ['Panic', 'Correction']:
+            exit_price = stop_loss_price if current_price <= stop_loss_price else current_price
+            current_capital = champion_equity[-1] * (exit_price / previous_price) # Recalculate from previous equity
+            current_capital *= (1 - COMMISSION_RATE)
+            position = 0
+
+    # Check for entry conditions
+    if position == 0:
+        ai_state_history.append(ai_state)
+        if len(ai_state_history) > persistence_filter:
+            ai_state_history.pop(0)
+
+        is_stable_herd = (len(ai_state_history) == persistence_filter and all(s == 'Herd' for s in ai_state_history))
+        if is_stable_herd:
+            position = 1
+            entry_price = current_price
+            current_capital *= (1 - COMMISSION_RATE)
+            stop_loss_price = entry_price - (2 * test_df['atr'].iloc[i])
+
+    # Trailing Stop Loss Logic
+    if position == 1:
+        if ai_state in ['Herd', 'FOMO']:
+            new_trailing_stop = current_price - (1 * test_df['atr'].iloc[i])
+            stop_loss_price = max(stop_loss_price, new_trailing_stop)
+
+    champion_equity.append(current_capital)
+
+champion_returns = pd.Series(champion_equity, index=test_df.index, name="Strategy").pct_change().fillna(0)
+print("True Champion Strategy backtest complete.")
+
+# ==============================================================================
+# --- 7. Performance Analysis and Visualization ---
+# ==============================================================================
+print("\n--- Performance Analysis ---")
+benchmark_made_trades = (benchmark_returns != 0).any()
+champion_made_trades = (champion_returns != 0).any()
+
+if benchmark_made_trades or champion_made_trades:
+    print("At least one strategy was active. Generating final comparative HTML report...")
+    qs.reports.html(
+        champion_returns,
+        benchmark=benchmark_returns,
+        output='final_comparison_report.html',
+        title='The True Champion AI vs. Benchmark',
+        rf=RISK_FREE_RATE
+    )
+    print("\nSaved 'final_comparison_report.html'")
+
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    # Plot cumulative returns
+    (1 + benchmark_returns).cumprod().plot(ax=ax, label='Benchmark', color='cyan')
+    (1 + champion_returns).cumprod().plot(ax=ax, label='Strategy', color='lime', linewidth=2)
+
+    ax.set_title('Final Strategy Comparison: Equity Curves', fontsize=16)
+    ax.set_ylabel('Cumulative Growth of $1')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    print("\nDisplaying final equity curve comparison plot...")
+    plt.show()
+
+else:
+    print("\n" + "="*50)
+    print("CRITICAL FINDING: Neither strategy made any trades during the backtest period.")
+    print("This is a valid scientific result indicating the entry conditions were not met.")
+    print("="*50 + "\n")
