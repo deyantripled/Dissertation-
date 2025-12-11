@@ -1,8 +1,5 @@
 # ==============================================================================
 # DISSERTATION FINAL SCRIPT
-# Logic: Optimistic (Close-based) -> Preserves 49% Return
-# Math: Adaptive Frequency -> Fixes Report CAGR (33%) & Calmar (8.3)
-# Extra: Prints "Total Return / DD" (12.41) for verification
 # ==============================================================================
 
 import pandas as pd
